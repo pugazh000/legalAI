@@ -2,9 +2,9 @@
 Backend logic for the Legal Document Simplifier AI.
 
 This version uses OpenRouter API (via langchain_openai.ChatOpenAI)
-instead of Google Gemini. Persistence with Chroma is disabled
-for Streamlit Cloud (sqlite issues).
+and stores vectors in memory (ephemeral Chroma, no SQLite dependency).
 """
+
 import json
 import os
 import difflib
@@ -17,9 +17,6 @@ from dateutil.relativedelta import relativedelta
 
 from dotenv import load_dotenv
 load_dotenv()
-
-# 🚫 Disable persistence on Streamlit Cloud (sqlite not supported)
-VECTORSTORE_PERSIST_DIR = None
 
 # -------------------------------------------------------------------------
 # LangChain / Embeddings / Vector DB / LLM
@@ -40,7 +37,7 @@ import numpy as np
 # -------------------------------------------------------------------------
 # LLM configuration (OpenRouter)
 # -------------------------------------------------------------------------
-OPENROUTER_API_KEY = os.getenv("GEMINI_API_KEY")  # OpenRouter key
+OPENROUTER_API_KEY = os.getenv("GEMINI_API_KEY")  # actually OpenRouter key
 MODEL_ID = os.getenv("MODEL_ID", "x-ai/grok-4-fast:free")
 
 if not OPENROUTER_API_KEY:
@@ -76,10 +73,13 @@ def parse_file(uploaded_file) -> str:
     return text
 
 # -------------------------------------------------------------------------
-# Vector store
+# Vector store (ephemeral, no SQLite)
 # -------------------------------------------------------------------------
 def _get_embedding_model(embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
     return HuggingFaceEmbeddings(model_name=embedding_model_name)
+
+# Keep a global store in memory
+VECTOR_STORES: Dict[str, Chroma] = {}
 
 def chunk_and_store(
     text: str,
@@ -87,7 +87,6 @@ def chunk_and_store(
     chunk_size: int = 500,
     chunk_overlap: int = 50,
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    persist_directory: str = VECTORSTORE_PERSIST_DIR,  # will be None on Streamlit
 ):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -95,25 +94,17 @@ def chunk_and_store(
         separators=["\n\n", "\n", " ", ""],
     )
     chunks = splitter.split_text(text)
-    docs = [Document(page_content=c, metadata={"chunk_id": str(i), "source": collection_name}) for i, c in enumerate(chunks)]
+    docs = [
+        Document(page_content=c, metadata={"chunk_id": str(i), "source": collection_name})
+        for i, c in enumerate(chunks)
+    ]
     embedder = _get_embedding_model(embedding_model_name)
-
-    if persist_directory:
-        chroma_db = Chroma.from_documents(
-            documents=docs,
-            embedding=embedder,
-            persist_directory=persist_directory,
-            collection_name=collection_name,
-        )
-        chroma_db.persist()
-    else:
-        # ✅ In-memory Chroma (avoids sqlite issues on Streamlit Cloud)
-        chroma_db = Chroma.from_documents(
-            documents=docs,
-            embedding=embedder,
-            collection_name=collection_name,
-        )
-
+    chroma_db = Chroma.from_documents(
+        documents=docs,
+        embedding=embedder,
+        collection_name=collection_name,
+    )
+    VECTOR_STORES[collection_name] = chroma_db
     return chroma_db
 
 # -------------------------------------------------------------------------
@@ -124,20 +115,17 @@ def semantic_search(
     collection_name: str = "legal_docs",
     top_k: int = 5,
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    persist_directory: str = VECTORSTORE_PERSIST_DIR,
     model_name: str = None,
 ) -> str:
-    embedder = _get_embedding_model(embedding_model_name)
-    vectordb = Chroma(
-        persist_directory=persist_directory,
-        embedding_function=embedder,
-        collection_name=collection_name,
-    ) if persist_directory else Chroma(
-        embedding_function=embedder,
-        collection_name=collection_name,
-    )
+    if collection_name not in VECTOR_STORES:
+        return "⚠️ No vector store found. Please upload and process a document first."
+
+    vectordb = VECTOR_STORES[collection_name]
     docs = vectordb.similarity_search(query, k=top_k)
-    ctxs = [f"--- chunk {i} from {d.metadata.get('source','')} ---\n{d.page_content.strip()[:2000]}" for i, d in enumerate(docs)]
+    ctxs = [
+        f"--- chunk {i} ---\n{d.page_content.strip()[:2000]}"
+        for i, d in enumerate(docs)
+    ]
     context_text = "\n\n".join(ctxs)
     llm = _get_llm(model_name=model_name, temperature=0.0)
     prompt_template = """You are a legal assistant. Use these retrieved chunks to answer:
@@ -192,32 +180,14 @@ Respond in JSON:
         parsed = {"High": [], "Medium": [], "Low": [], "Obligations": []}
     return {k: parsed.get(k, []) for k in ["High", "Medium", "Low"]}, parsed.get("Obligations", [])
 
-# -------------------------------------------------------------------------
-# Safe wrapper
-# -------------------------------------------------------------------------
 def safe_analyze_document_for_risks(text: str, model_name: str = None) -> Tuple[Dict[str, List[str]], List[str]]:
+    """Wrapper with fallback if risk analysis fails."""
     try:
         return analyze_document_for_risks(text, model_name)
     except Exception as e:
         print(f"Analysis failed with error: {e}")
         risks = {"High": [], "Medium": [], "Low": []}
-        obligations = []
-        text_lower = text.lower()
-        if 'expir' in text_lower:
-            risks["High"].append("Document may contain expired items - manual review required")
-        if any(word in text_lower for word in ['breach', 'default', 'violation']):
-            risks["High"].append("Breach or default language detected")
-        if any(word in text_lower for word in ['penalty', 'fine']):
-            risks["High"].append("Penalty clauses identified")
-        if any(word in text_lower for word in ['payment', 'fee', 'cost']):
-            risks["Medium"].append("Financial obligations present")
-        if any(word in text_lower for word in ['comply', 'regulation', 'requirement']):
-            risks["Medium"].append("Compliance requirements indicated")
-        if any(word in text_lower for word in ['report', 'submission']):
-            risks["Medium"].append("Reporting obligations may apply")
-        if any(word in text_lower for word in ['shall', 'must', 'required']):
-            obligations.append("Document contains mandatory obligations - review recommended")
-        obligations.append("Manual review recommended due to analysis limitations")
+        obligations = ["Manual review recommended due to analysis limitations"]
         return risks, obligations
 
 # -------------------------------------------------------------------------
@@ -226,6 +196,7 @@ def safe_analyze_document_for_risks(text: str, model_name: str = None) -> Tuple[
 def simple_date_validator(text: str) -> Dict[str, Any]:
     date_matches = re.findall(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", text)
     results = {"status": "UNKNOWN", "message": "No clear dates found", "action_needed": []}
+
     if date_matches:
         try:
             expiry = parse_date(date_matches[-1])
@@ -245,13 +216,16 @@ def simple_date_validator(text: str) -> Dict[str, Any]:
             results["message"] = f"Date parsing failed: {e}"
     return results
 
-def semantic_search_with_dates(query: str, collection_name: str = "legal_docs", top_k: int = 5, embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2", persist_directory: str = VECTORSTORE_PERSIST_DIR) -> str:
-    base_answer = semantic_search(query, collection_name, top_k, embedding_model_name, persist_directory)
-    embedder = _get_embedding_model(embedding_model_name)
-    vectordb = Chroma(embedding_function=embedder, collection_name=collection_name)
+def semantic_search_with_dates(query: str, collection_name: str = "legal_docs", top_k: int = 5) -> str:
+    base_answer = semantic_search(query=query, collection_name=collection_name, top_k=top_k)
+    if collection_name not in VECTOR_STORES:
+        return base_answer
+
+    vectordb = VECTOR_STORES[collection_name]
     docs = vectordb.similarity_search(query, k=top_k)
     combined_text = " ".join(d.page_content for d in docs)
     validation = simple_date_validator(combined_text)
+
     if validation["status"] == "EXPIRED":
         return f"🔴 NO - {validation['message']}"
     elif validation["status"] == "EXPIRING_SOON":
@@ -279,13 +253,16 @@ def intelligent_date_extraction_and_validation(text: str) -> Dict[str, Any]:
             continue
     return {"dates": extracted_dates, "count": len(extracted_dates)}
 
-def semantic_search_with_intelligent_validation(query: str, collection_name: str = "legal_docs", top_k: int = 5, embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2", persist_directory: str = VECTORSTORE_PERSIST_DIR) -> str:
-    base_answer = semantic_search(query, collection_name, top_k, embedding_model_name, persist_directory)
-    embedder = _get_embedding_model(embedding_model_name)
-    vectordb = Chroma(embedding_function=embedder, collection_name=collection_name)
+def semantic_search_with_intelligent_validation(query: str, collection_name: str = "legal_docs", top_k: int = 5) -> str:
+    base_answer = semantic_search(query=query, collection_name=collection_name, top_k=top_k)
+    if collection_name not in VECTOR_STORES:
+        return base_answer
+
+    vectordb = VECTOR_STORES[collection_name]
     docs = vectordb.similarity_search(query, k=top_k)
     combined_text = " ".join(d.page_content for d in docs)
     extracted = intelligent_date_extraction_and_validation(combined_text)
+
     if not extracted["dates"]:
         return base_answer + "\n\nℹ️ No clear dates found in document."
     else:
@@ -311,5 +288,5 @@ def embed_texts(texts: List[str], embedding_model_name: str = "sentence-transfor
 # Entry point
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Backend module loaded. VECTORSTORE persist dir:", VECTORSTORE_PERSIST_DIR)
+    print("Backend module loaded (in-memory Chroma).")
     print("Using model:", MODEL_ID)
