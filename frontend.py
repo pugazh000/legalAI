@@ -56,8 +56,8 @@ if uploaded_file:
     st.success("File parsed and stored in memory.")
     st.text_area("Parsed text (primary)", value=st.session_state.doc1_text[:4000], height=200)
 
-    # Auto-ingest into Chroma right after parsing
-    with st.spinner("Chunking, embedding, and storing into vector store..."):
+    # Auto-ingest into FAISS right after parsing
+    with st.spinner("Chunking, embedding, and storing into FAISS vector store..."):
         chunk_and_store(
             text=st.session_state.doc1_text,
             collection_name=st.session_state.collection_name,
@@ -66,7 +66,7 @@ if uploaded_file:
             embedding_model_name="sentence-transformers/all-MiniLM-L6-v2",
         )
         st.session_state.vectorstore_ready = True
-    st.success("Document ingested into vector store. Ready for semantic queries.")
+    st.success("✅ Document ingested into FAISS vector store. Ready for semantic queries.")
 
 # --- Section 2: Plain Language Summary
 st.header("📑 Plain Language Summary")
