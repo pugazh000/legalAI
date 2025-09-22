@@ -9,6 +9,7 @@ Requirements:
 """
 
 import streamlit as st
+import io
 
 from backend import (
     parse_file,
@@ -37,6 +38,12 @@ if "vectorstore_ready" not in st.session_state:
     st.session_state.vectorstore_ready = False
 if "collection_name" not in st.session_state:
     st.session_state.collection_name = "legal_docs"
+if "last_summary" not in st.session_state:
+    st.session_state.last_summary = ""
+if "last_risk_report" not in st.session_state:
+    st.session_state.last_risk_report = ""
+if "last_comparison" not in st.session_state:
+    st.session_state.last_comparison = ""
 
 # --- Section 1: Upload and Analyze Documents
 st.header("📤 Upload & Analyze Documents")
@@ -68,7 +75,17 @@ if st.button("Generate Summary"):
     else:
         with st.spinner("Generating simplified summary..."):
             summary = summarize_text(st.session_state.doc1_text)
+        st.session_state.last_summary = summary
         st.info(summary)
+
+        # ✅ Download button
+        buffer = io.BytesIO(summary.encode("utf-8"))
+        st.download_button(
+            "⬇️ Download Summary",
+            buffer,
+            file_name="summary.txt",
+            mime="text/plain",
+        )
 
 # --- Section 3: Risk & Obligation Analysis
 st.header("⚠️ Risk & Obligation Analysis")
@@ -79,6 +96,7 @@ if st.button("Analyze Risks & Obligations"):
         with st.spinner("Analyzing risks and obligations..."):
             risks, obligations = safe_analyze_document_for_risks(st.session_state.doc1_text)
 
+        report_lines = []
         st.subheader("Risks")
         for level, items in risks.items():
             if items:
@@ -88,66 +106,26 @@ if st.button("Analyze Risks & Obligations"):
                     st.warning(f"**Medium Risks:**\n- " + "\n- ".join(items))
                 else:
                     st.info(f"**Low Risks:**\n- " + "\n- ".join(items))
+                report_lines.append(f"{level} Risks:\n- " + "\n- ".join(items))
 
         st.subheader("Obligations")
         if obligations:
             st.success("**Obligations:**\n- " + "\n- ".join(obligations))
+            report_lines.append("Obligations:\n- " + "\n- ".join(obligations))
         else:
             st.info("No clear obligations detected.")
 
-# --- Section: Enhanced Search with Date Validation
-st.header("🔍 Smart Validity Check")
-st.caption("Ask about document validity - now with intelligent date analysis!")
+        risk_report = "\n\n".join(report_lines)
+        st.session_state.last_risk_report = risk_report
 
-validity_query = st.text_input("Ask about validity:", value="Is my insurance valid?", key="validity_search")
-
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("🚀 Check Validity", type="primary"):
-        if not st.session_state.vectorstore_ready:
-            st.error("Please upload and process a document first.")
-        else:
-            with st.spinner("Analyzing document with date intelligence..."):
-                try:
-                    answer = semantic_search_with_dates(
-                        query=validity_query,
-                        collection_name="legal_docs",
-                        top_k=5
-                    )
-                    if "🔴 NO" in answer or "NOT VALID" in answer:
-                        st.error(answer)
-                    elif "🟢 YES" in answer or "VALID" in answer:
-                        st.success(answer)
-                    elif "🟡" in answer or "EXPIRING" in answer:
-                        st.warning(answer)
-                    else:
-                        st.info(answer)
-                except Exception as e:
-                    st.error(f"Enhanced search failed: {str(e)}")
-                    st.info("Try the regular semantic search above.")
-
-with col2:
-    if st.button("📅 Quick Date Check"):
-        if not st.session_state.doc1_text:
-            st.error("Please upload a document first.")
-        else:
-            with st.spinner("Extracting dates..."):
-                try:
-                    results = simple_date_validator(st.session_state.doc1_text)
-                    if results["status"] == "EXPIRED":
-                        st.error(f"❌ **EXPIRED**: {results['message']}")
-                    elif results["status"] == "VALID":
-                        st.success(f"✅ **VALID**: {results['message']}")
-                    elif results["status"] == "EXPIRING_SOON":
-                        st.warning(f"⚠️ **EXPIRING SOON**: {results['message']}")
-                    else:
-                        st.info(f"ℹ️ {results['message']}")
-                    if results["action_needed"]:
-                        st.write("**Actions needed:**")
-                        for action in results["action_needed"]:
-                            st.write(f"• {action}")
-                except Exception as e:
-                    st.error(f"Date check failed: {str(e)}")
+        # ✅ Download button
+        buffer = io.BytesIO(risk_report.encode("utf-8"))
+        st.download_button(
+            "⬇️ Download Risk Report",
+            buffer,
+            file_name="risks_and_obligations.txt",
+            mime="text/plain",
+        )
 
 # --- Section 4: Semantic Search
 st.header("🔍 Semantic Search")
@@ -179,8 +157,49 @@ if st.button("Compare Documents"):
         st.error("Please upload both documents first.")
     else:
         diff_report = compare_documents(st.session_state.doc1_text, st.session_state.doc2_text)
+        st.session_state.last_comparison = diff_report
         st.markdown(diff_report)
 
-# --- Section 6: Download Placeholder
-st.header("⬇️ Download")
-st.write("Download functionality scaffolded (not wired to actual file outputs in this demo).")
+        # ✅ Download button
+        buffer = io.BytesIO(diff_report.encode("utf-8"))
+        st.download_button(
+            "⬇️ Download Comparison Report",
+            buffer,
+            file_name="comparison_report.txt",
+            mime="text/plain",
+        )
+
+# --- Section 6: Smart Validity Check
+st.header("🔍 Smart Validity Check")
+st.caption("Ask about document validity - now with intelligent date analysis!")
+
+validity_query = st.text_input("Ask about validity:", value="Is my insurance valid?", key="validity_search")
+
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("🚀 Check Validity", type="primary"):
+        if not st.session_state.vectorstore_ready:
+            st.error("Please upload and process a document first.")
+        else:
+            with st.spinner("Analyzing document with date intelligence..."):
+                try:
+                    answer = semantic_search_with_dates(
+                        query=validity_query,
+                        collection_name="legal_docs",
+                        top_k=5
+                    )
+                    st.info(answer)
+                except Exception as e:
+                    st.error(f"Enhanced search failed: {str(e)}")
+
+with col2:
+    if st.button("📅 Quick Date Check"):
+        if not st.session_state.doc1_text:
+            st.error("Please upload a document first.")
+        else:
+            with st.spinner("Extracting dates..."):
+                try:
+                    results = simple_date_validator(st.session_state.doc1_text)
+                    st.json(results)
+                except Exception as e:
+                    st.error(f"Date check failed: {str(e)}")
