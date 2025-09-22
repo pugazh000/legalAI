@@ -19,10 +19,12 @@ load_dotenv()
 
 VECTORSTORE_PERSIST_DIR = os.getenv("VECTORSTORE_PERSIST_DIR", "./chroma_db")
 
+# -------------------------------------------------------------------------
 # LangChain / Embeddings / Vector DB / LLM
+# -------------------------------------------------------------------------
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings   # ✅ updated
+from langchain_community.vectorstores import Chroma                # ✅ updated
 from langchain.docstore.document import Document
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
@@ -172,6 +174,37 @@ Respond in JSON:
     return {k: parsed.get(k, []) for k in ["High", "Medium", "Low"]}, parsed.get("Obligations", [])
 
 # -------------------------------------------------------------------------
+# Safe wrapper (prevents frontend import errors)
+# -------------------------------------------------------------------------
+def safe_analyze_document_for_risks(text: str, model_name: str = None) -> Tuple[Dict[str, List[str]], List[str]]:
+    """
+    Wrapper with fallback if risk analysis fails.
+    """
+    try:
+        return analyze_document_for_risks(text, model_name)
+    except Exception as e:
+        print(f"Analysis failed with error: {e}")
+        risks = {"High": [], "Medium": [], "Low": []}
+        obligations = []
+        text_lower = text.lower()
+        if 'expir' in text_lower:
+            risks["High"].append("Document may contain expired items - manual review required")
+        if any(word in text_lower for word in ['breach', 'default', 'violation']):
+            risks["High"].append("Breach or default language detected")
+        if any(word in text_lower for word in ['penalty', 'fine']):
+            risks["High"].append("Penalty clauses identified")
+        if any(word in text_lower for word in ['payment', 'fee', 'cost']):
+            risks["Medium"].append("Financial obligations present")
+        if any(word in text_lower for word in ['comply', 'regulation', 'requirement']):
+            risks["Medium"].append("Compliance requirements indicated")
+        if any(word in text_lower for word in ['report', 'submission']):
+            risks["Medium"].append("Reporting obligations may apply")
+        if any(word in text_lower for word in ['shall', 'must', 'required']):
+            obligations.append("Document contains mandatory obligations - review recommended")
+        obligations.append("Manual review recommended due to analysis limitations")
+        return risks, obligations
+
+# -------------------------------------------------------------------------
 # Utility functions
 # -------------------------------------------------------------------------
 def compare_documents(text1: str, text2: str) -> str:
@@ -187,13 +220,8 @@ def embed_texts(texts: List[str], embedding_model_name: str = "sentence-transfor
     return embedder.embed_documents(texts)
 
 # -------------------------------------------------------------------------
-# (Keep your existing date validators, intelligent validation,
-# semantic_search_with_dates, semantic_search_with_intelligent_validation,
-# safe_analyze_document_for_risks, etc. — all unchanged except that
-# every LLM call now uses _get_llm instead of _get_gemini_llm.)
+# Entry point
 # -------------------------------------------------------------------------
-
-# Entry point for quick test
 if __name__ == "__main__":
     print("Backend module loaded. VECTORSTORE persist dir:", VECTORSTORE_PERSIST_DIR)
     print("Using model:", MODEL_ID)
