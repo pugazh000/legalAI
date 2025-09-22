@@ -205,6 +205,133 @@ def safe_analyze_document_for_risks(text: str, model_name: str = None) -> Tuple[
         return risks, obligations
 
 # -------------------------------------------------------------------------
+# Date Validators & Smart Semantic Search
+# -------------------------------------------------------------------------
+def simple_date_validator(text: str) -> Dict[str, Any]:
+    """Quickly checks if the document is expired, valid, or expiring soon."""
+    date_matches = re.findall(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", text)
+    results = {"status": "UNKNOWN", "message": "No clear dates found", "action_needed": []}
+
+    if date_matches:
+        try:
+            expiry = parse_date(date_matches[-1])  # assume last date is expiry
+            now = datetime.now()
+            if expiry < now:
+                results["status"] = "EXPIRED"
+                results["message"] = f"Expired on {expiry.date()}"
+                results["action_needed"].append("Renew or renegotiate the contract")
+            elif expiry < now + timedelta(days=30):
+                results["status"] = "EXPIRING_SOON"
+                results["message"] = f"Expires soon on {expiry.date()}"
+                results["action_needed"].append("Plan renewal or extension")
+            else:
+                results["status"] = "VALID"
+                results["message"] = f"Valid until {expiry.date()}"
+        except Exception as e:
+            results["message"] = f"Date parsing failed: {e}"
+    return results
+
+
+def semantic_search_with_dates(
+    query: str,
+    collection_name: str = "legal_docs",
+    top_k: int = 5,
+    embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    persist_directory: str = VECTORSTORE_PERSIST_DIR,
+) -> str:
+    """
+    Semantic search + date check.
+    Useful for queries like 'Is my contract still valid?'.
+    """
+    base_answer = semantic_search(
+        query=query,
+        collection_name=collection_name,
+        top_k=top_k,
+        embedding_model_name=embedding_model_name,
+        persist_directory=persist_directory,
+    )
+
+    embedder = _get_embedding_model(embedding_model_name)
+    vectordb = Chroma(
+        persist_directory=persist_directory,
+        embedding_function=embedder,
+        collection_name=collection_name,
+    )
+    docs = vectordb.similarity_search(query, k=top_k)
+    combined_text = " ".join(d.page_content for d in docs)
+    validation = simple_date_validator(combined_text)
+
+    if validation["status"] == "EXPIRED":
+        return f"🔴 NO - {validation['message']}"
+    elif validation["status"] == "EXPIRING_SOON":
+        return f"🟡 ALMOST EXPIRED - {validation['message']}"
+    elif validation["status"] == "VALID":
+        return f"🟢 YES - {validation['message']}"
+    else:
+        return base_answer
+
+
+def intelligent_date_extraction_and_validation(text: str) -> Dict[str, Any]:
+    """
+    Extracts all dates in a document and classifies them.
+    """
+    date_matches = re.findall(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", text)
+    extracted_dates = []
+    now = datetime.now()
+
+    for d in date_matches:
+        try:
+            dt = parse_date(d)
+            if dt < now:
+                status = "Past"
+            elif dt < now + timedelta(days=30):
+                status = "Expiring Soon"
+            else:
+                status = "Future"
+            extracted_dates.append({"date": str(dt.date()), "status": status})
+        except Exception:
+            continue
+
+    return {"dates": extracted_dates, "count": len(extracted_dates)}
+
+
+def semantic_search_with_intelligent_validation(
+    query: str,
+    collection_name: str = "legal_docs",
+    top_k: int = 5,
+    embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    persist_directory: str = VECTORSTORE_PERSIST_DIR,
+) -> str:
+    """
+    Semantic search with intelligent date validation (uses extraction + classification).
+    """
+    base_answer = semantic_search(
+        query=query,
+        collection_name=collection_name,
+        top_k=top_k,
+        embedding_model_name=embedding_model_name,
+        persist_directory=persist_directory,
+    )
+
+    embedder = _get_embedding_model(embedding_model_name)
+    vectordb = Chroma(
+        persist_directory=persist_directory,
+        embedding_function=embedder,
+        collection_name=collection_name,
+    )
+    docs = vectordb.similarity_search(query, k=top_k)
+    combined_text = " ".join(d.page_content for d in docs)
+    extracted = intelligent_date_extraction_and_validation(combined_text)
+
+    if not extracted["dates"]:
+        return base_answer + "\n\nℹ️ No clear dates found in document."
+    else:
+        summary_lines = [
+            f"- {d['date']} → {d['status']}" for d in extracted["dates"]
+        ]
+        return base_answer + "\n\n📅 Date Analysis:\n" + "\n".join(summary_lines)
+
+# -------------------------------------------------------------------------
 # Utility functions
 # -------------------------------------------------------------------------
 def compare_documents(text1: str, text2: str) -> str:
