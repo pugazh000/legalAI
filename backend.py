@@ -1,8 +1,9 @@
 """
 Backend logic for the Legal Document Simplifier AI.
 
-This version uses OpenRouter API (via langchain_openai.ChatOpenAI)
-and stores vectors in FAISS (in-memory, no SQLite dependency).
+- Uses OpenRouter via langchain_openai.ChatOpenAI
+- Uses FAISS for in-memory vector storage (no sqlite)
+- Includes date utilities and safe wrappers for robustness
 """
 
 import json
@@ -33,18 +34,35 @@ import pdfplumber
 import docx
 
 # -------------------------------------------------------------------------
-# LLM configuration (OpenRouter)
+# Config / Env
 # -------------------------------------------------------------------------
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")  # your OpenRouter key
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL_ID = os.getenv("MODEL_ID", "x-ai/grok-4-fast:free")
 
-if not OPENROUTER_API_KEY:
-    print("⚠️ Warning: OpenRouter API key not set. LLM calls will fail.")
+# Helpful debug print at import time (will show up in logs)
+print("=== BACKEND STARTUP ===")
+print(f"Model ID from env: {MODEL_ID}")
+print(f"OPENROUTER_API_KEY present: {'YES' if OPENROUTER_API_KEY else 'NO'}")
+print("=======================")
 
+# -------------------------------------------------------------------------
+# LLM client factory (OpenRouter)
+# -------------------------------------------------------------------------
 def _get_llm(model_name: str = None, temperature: float = 0.0):
-    """Return a ChatOpenAI client configured for OpenRouter."""
+    """Return a ChatOpenAI client configured for OpenRouter and log key/base status."""
     if model_name is None:
         model_name = MODEL_ID
+
+    # Debug logs to help diagnose 401/auth issues on deploy
+    try:
+        key_present = bool(OPENROUTER_API_KEY and len(OPENROUTER_API_KEY) > 8)
+    except Exception:
+        key_present = False
+
+    print(f"🔧 _get_llm() -> model: {model_name}")
+    print(f"🔧 OPENROUTER key loaded? {'YES' if key_present else 'NO'}")
+    print("🔧 openai_api_base: https://openrouter.ai/api/v1 (requests will be routed there)")
+
     return ChatOpenAI(
         model=model_name,
         openai_api_key=OPENROUTER_API_KEY,
@@ -67,15 +85,18 @@ def parse_file(uploaded_file) -> str:
         doc = docx.Document(io.BytesIO(content))
         text = "\n\n".join([p.text for p in doc.paragraphs])
     else:
+        # fallback for plain text uploads
         text = content.decode("utf-8", errors="ignore")
     return text
 
 # -------------------------------------------------------------------------
-# Vector store (FAISS, in-memory)
+# Embeddings & Vector store (FAISS, in-memory)
 # -------------------------------------------------------------------------
 def _get_embedding_model(embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    """Return a HuggingFaceEmbeddings instance."""
     return HuggingFaceEmbeddings(model_name=embedding_model_name)
 
+# Global in-memory stores (per-process)
 VECTOR_STORES: Dict[str, FAISS] = {}
 
 def chunk_and_store(
@@ -85,7 +106,10 @@ def chunk_and_store(
     chunk_overlap: int = 50,
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
 ):
-    """Split document into chunks and store in FAISS."""
+    """
+    Split text into chunks, embed, and store in an in-memory FAISS vector store.
+    Returns the vector store object.
+    """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -96,9 +120,11 @@ def chunk_and_store(
         Document(page_content=c, metadata={"chunk_id": str(i), "source": collection_name})
         for i, c in enumerate(chunks)
     ]
+
     embedder = _get_embedding_model(embedding_model_name)
     vectordb = FAISS.from_documents(docs, embedder)
     VECTOR_STORES[collection_name] = vectordb
+    print(f"📚 Stored {len(chunks)} chunks into FAISS collection '{collection_name}'")
     return vectordb
 
 # -------------------------------------------------------------------------
@@ -111,11 +137,14 @@ def semantic_search(
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     model_name: str = None,
 ) -> str:
+    """Retrieve relevant chunks and call LLM to answer in plain English."""
     if collection_name not in VECTOR_STORES:
         return "⚠️ No vector store found. Please upload and process a document first."
 
     vectordb = VECTOR_STORES[collection_name]
     docs = vectordb.similarity_search(query, k=top_k)
+
+    # Build context from retrieved chunks
     ctxs = [f"--- chunk {i} ---\n{d.page_content.strip()[:2000]}" for i, d in enumerate(docs)]
     context_text = "\n\n".join(ctxs)
 
@@ -135,6 +164,7 @@ Answer clearly in plain English for a non-lawyer.
     return chain.run({"context": context_text, "question": query})
 
 def summarize_text(text: str, model_name: str = None) -> str:
+    """Summarize a document in plain language (LLM call)."""
     llm = _get_llm(model_name=model_name, temperature=0.0)
     prompt_template = """Summarize the document in plain language.
 Highlight purpose, key obligations, important dates, and immediate actions.
@@ -146,6 +176,7 @@ DOCUMENT:
     return chain.run({"doc": text})
 
 def analyze_document_for_risks(text: str, model_name: str = None) -> Tuple[Dict[str, List[str]], List[str]]:
+    """Ask LLM to identify risks and obligations and return parsed JSON (fallback-safe)."""
     llm = _get_llm(model_name=model_name, temperature=0.0)
     prompt_template = """Analyze this document and identify risks and obligations.
 
@@ -167,14 +198,17 @@ Respond in JSON:
         if cleaned.startswith("```"):
             cleaned = "\n".join(cleaned.splitlines()[1:-1])
         parsed = json.loads(re.search(r"\{.*\}", cleaned, re.DOTALL).group(0))
-    except Exception:
+    except Exception as e:
+        print("⚠️ Risk parsing failed:", e)
         parsed = {"High": [], "Medium": [], "Low": [], "Obligations": []}
     return {k: parsed.get(k, []) for k in ["High", "Medium", "Low"]}, parsed.get("Obligations", [])
 
 def safe_analyze_document_for_risks(text: str, model_name: str = None) -> Tuple[Dict[str, List[str]], List[str]]:
+    """Wrapper with fallback when LLM analysis fails."""
     try:
         return analyze_document_for_risks(text, model_name)
-    except Exception:
+    except Exception as e:
+        print("⚠️ safe_analyze_document_for_risks fallback triggered:", e)
         risks = {"High": [], "Medium": [], "Low": []}
         obligations = ["Manual review recommended due to analysis limitations"]
         return risks, obligations
@@ -183,6 +217,7 @@ def safe_analyze_document_for_risks(text: str, model_name: str = None) -> Tuple[
 # Date Validators & Smart Semantic Search
 # -------------------------------------------------------------------------
 def simple_date_validator(text: str) -> Dict[str, Any]:
+    """Simple date extraction/validity check using ISO-like date patterns."""
     date_matches = re.findall(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", text)
     results = {"status": "UNKNOWN", "message": "No clear dates found", "action_needed": []}
 
@@ -206,6 +241,7 @@ def simple_date_validator(text: str) -> Dict[str, Any]:
     return results
 
 def semantic_search_with_dates(query: str, collection_name: str = "legal_docs", top_k: int = 5) -> str:
+    """Run semantic search and appended date-validation result for time-sensitive queries."""
     base_answer = semantic_search(query=query, collection_name=collection_name, top_k=top_k)
     if collection_name not in VECTOR_STORES:
         return base_answer
@@ -225,7 +261,7 @@ def semantic_search_with_dates(query: str, collection_name: str = "legal_docs", 
         return base_answer
 
 def intelligent_date_extraction_and_validation(text: str) -> Dict[str, Any]:
-    """Extract and validate multiple dates in the document."""
+    """Find multiple ISO-like dates in text and classify them by status."""
     date_matches = re.findall(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", text)
     extracted_dates = []
     now = datetime.now()
@@ -244,6 +280,7 @@ def intelligent_date_extraction_and_validation(text: str) -> Dict[str, Any]:
     return {"dates": extracted_dates, "count": len(extracted_dates)}
 
 def semantic_search_with_intelligent_validation(query: str, collection_name: str = "legal_docs", top_k: int = 5) -> str:
+    """Semantic search plus a helpful date-extraction summary appended to the LLM answer."""
     base_answer = semantic_search(query=query, collection_name=collection_name, top_k=top_k)
     if collection_name not in VECTOR_STORES:
         return base_answer
@@ -260,9 +297,10 @@ def semantic_search_with_intelligent_validation(query: str, collection_name: str
         return base_answer + "\n\n📅 Date Analysis:\n" + "\n".join(summary_lines)
 
 # -------------------------------------------------------------------------
-# Utility functions
+# Utilities
 # -------------------------------------------------------------------------
 def compare_documents(text1: str, text2: str) -> str:
+    """Simple unified-diff style comparison returned as markdown codeblock."""
     a_lines, b_lines = text1.splitlines(), text2.splitlines()
     diff = difflib.unified_diff(a_lines, b_lines, fromfile="Document A", tofile="Document B", lineterm="")
     md_lines = ["### Document Comparison\n", "```diff"]
@@ -270,7 +308,8 @@ def compare_documents(text1: str, text2: str) -> str:
     md_lines.append("```")
     return "\n".join(md_lines)
 
-def embed_texts(texts: List[str], embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+def embed_texts(texts: List[str], embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> List[List[float]]:
+    """Return raw embeddings for a list of texts (uses HuggingFaceEmbeddings)."""
     embedder = _get_embedding_model(embedding_model_name)
     return embedder.embed_documents(texts)
 
@@ -278,5 +317,5 @@ def embed_texts(texts: List[str], embedding_model_name: str = "sentence-transfor
 # Entry point
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Backend module loaded (FAISS, in-memory).")
-    print("Using model:", MODEL_ID)
+    print("Backend module loaded (FAISS, OpenRouter).")
+    print("Model ID:", MODEL_ID)
