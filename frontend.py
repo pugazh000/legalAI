@@ -8,6 +8,7 @@ Requirements:
     pip install -r requirements.txt
 """
 
+import os
 import streamlit as st
 import io
 
@@ -203,3 +204,7 @@ with col2:
                     st.json(results)
                 except Exception as e:
                     st.error(f"Date check failed: {str(e)}")
+
+# --- Footer
+st.header("📂 Download Section")
+st.write("You can download summaries, risk reports, and comparisons above when generated.")
