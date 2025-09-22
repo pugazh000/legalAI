@@ -4,7 +4,7 @@ langchain-community
 langchain-openai
 sentence-transformers
 transformers
-chromadb
+faiss-cpu
 pdfplumber
 python-docx
 numpy
