@@ -37,7 +37,7 @@ import numpy as np
 # -------------------------------------------------------------------------
 # LLM configuration (OpenRouter)
 # -------------------------------------------------------------------------
-OPENROUTER_API_KEY = os.getenv("GEMINI_API_KEY")  # actually OpenRouter key
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")  # actually OpenRouter key
 MODEL_ID = os.getenv("MODEL_ID", "x-ai/grok-4-fast:free")
 
 if not OPENROUTER_API_KEY:
@@ -283,3 +283,4 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 if __name__ == "__main__":
     print("Backend module loaded (FAISS in-memory).")
     print("Using model:", MODEL_ID)
+
