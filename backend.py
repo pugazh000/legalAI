@@ -2,7 +2,7 @@
 Backend logic for the Legal Document Simplifier AI.
 
 This version uses OpenRouter API (via langchain_openai.ChatOpenAI)
-and stores vectors in memory (ephemeral Chroma, no SQLite dependency).
+and stores vectors in FAISS (no SQLite dependency).
 """
 
 import json
@@ -23,7 +23,7 @@ load_dotenv()
 # -------------------------------------------------------------------------
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
@@ -73,13 +73,13 @@ def parse_file(uploaded_file) -> str:
     return text
 
 # -------------------------------------------------------------------------
-# Vector store (ephemeral, no SQLite)
+# Vector store (FAISS, in-memory)
 # -------------------------------------------------------------------------
 def _get_embedding_model(embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
     return HuggingFaceEmbeddings(model_name=embedding_model_name)
 
 # Keep a global store in memory
-VECTOR_STORES: Dict[str, Chroma] = {}
+VECTOR_STORES: Dict[str, FAISS] = {}
 
 def chunk_and_store(
     text: str,
@@ -99,13 +99,9 @@ def chunk_and_store(
         for i, c in enumerate(chunks)
     ]
     embedder = _get_embedding_model(embedding_model_name)
-    chroma_db = Chroma.from_documents(
-        documents=docs,
-        embedding=embedder,
-        collection_name=collection_name,
-    )
-    VECTOR_STORES[collection_name] = chroma_db
-    return chroma_db
+    faiss_db = FAISS.from_documents(docs, embedder)
+    VECTOR_STORES[collection_name] = faiss_db
+    return faiss_db
 
 # -------------------------------------------------------------------------
 # Core RAG functions
@@ -114,7 +110,6 @@ def semantic_search(
     query: str,
     collection_name: str = "legal_docs",
     top_k: int = 5,
-    embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     model_name: str = None,
 ) -> str:
     if collection_name not in VECTOR_STORES:
@@ -122,11 +117,9 @@ def semantic_search(
 
     vectordb = VECTOR_STORES[collection_name]
     docs = vectordb.similarity_search(query, k=top_k)
-    ctxs = [
-        f"--- chunk {i} ---\n{d.page_content.strip()[:2000]}"
-        for i, d in enumerate(docs)
-    ]
+    ctxs = [f"--- chunk {i} ---\n{d.page_content.strip()[:2000]}" for i, d in enumerate(docs)]
     context_text = "\n\n".join(ctxs)
+
     llm = _get_llm(model_name=model_name, temperature=0.0)
     prompt_template = """You are a legal assistant. Use these retrieved chunks to answer:
 
@@ -280,13 +273,13 @@ def compare_documents(text1: str, text2: str) -> str:
     md_lines.append("```")
     return "\n".join(md_lines)
 
-def embed_texts(texts: List[str], embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-    embedder = _get_embedding_model(embedding_model_name)
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    embedder = _get_embedding_model()
     return embedder.embed_documents(texts)
 
 # -------------------------------------------------------------------------
 # Entry point
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Backend module loaded (in-memory Chroma).")
+    print("Backend module loaded (FAISS in-memory).")
     print("Using model:", MODEL_ID)
