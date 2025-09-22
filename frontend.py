@@ -4,25 +4,21 @@ Streamlit frontend for "⚖ The Legal Simplifier AI".
 Run:
     streamlit run frontend.py
 
-Requirements (example):
-pip install streamlit langchain pdfplumber python-docx chromadb sentence-transformers transformers
-pip install langchain-openai  # LangChain OpenRouter connector
+Requirements:
+    pip install -r requirements.txt
 """
 
-import os
 import streamlit as st
 
 from backend import (
     parse_file,
     chunk_and_store,
     summarize_text,
-    analyze_document_for_risks,
     safe_analyze_document_for_risks,
     semantic_search,
-    intelligent_date_extraction_and_validation,  # NEW
-    semantic_search_with_intelligent_validation,  # NEW
+    intelligent_date_extraction_and_validation,
+    semantic_search_with_intelligent_validation,
     compare_documents,
-    VECTORSTORE_PERSIST_DIR,
     simple_date_validator,
     semantic_search_with_dates,
 )
@@ -53,14 +49,13 @@ if uploaded_file:
     st.text_area("Parsed text (primary)", value=st.session_state.doc1_text[:4000], height=200)
 
     # Auto-ingest into Chroma right after parsing
-    with st.spinner("Chunking, embedding, and storing into Chroma vector store..."):
+    with st.spinner("Chunking, embedding, and storing into vector store..."):
         chunk_and_store(
             text=st.session_state.doc1_text,
             collection_name=st.session_state.collection_name,
             chunk_size=500,
             chunk_overlap=50,
             embedding_model_name="sentence-transformers/all-MiniLM-L6-v2",
-            persist_directory=VECTORSTORE_PERSIST_DIR,
         )
         st.session_state.vectorstore_ready = True
     st.success("Document ingested into vector store. Ready for semantic queries.")
@@ -76,10 +71,31 @@ if st.button("Generate Summary"):
         st.info(summary)
 
 # --- Section 3: Risk & Obligation Analysis
-# (UNCHANGED — logic already good)
-# ...
+st.header("⚠️ Risk & Obligation Analysis")
+if st.button("Analyze Risks & Obligations"):
+    if not st.session_state.doc1_text:
+        st.error("Please upload and parse a primary document first.")
+    else:
+        with st.spinner("Analyzing risks and obligations..."):
+            risks, obligations = safe_analyze_document_for_risks(st.session_state.doc1_text)
 
-# --- Section: Enhanced Search with Date Validation (NEW)
+        st.subheader("Risks")
+        for level, items in risks.items():
+            if items:
+                if level == "High":
+                    st.error(f"**High Risks:**\n- " + "\n- ".join(items))
+                elif level == "Medium":
+                    st.warning(f"**Medium Risks:**\n- " + "\n- ".join(items))
+                else:
+                    st.info(f"**Low Risks:**\n- " + "\n- ".join(items))
+
+        st.subheader("Obligations")
+        if obligations:
+            st.success("**Obligations:**\n- " + "\n- ".join(obligations))
+        else:
+            st.info("No clear obligations detected.")
+
+# --- Section: Enhanced Search with Date Validation
 st.header("🔍 Smart Validity Check")
 st.caption("Ask about document validity - now with intelligent date analysis!")
 
@@ -145,14 +161,26 @@ if st.button("Search"):
                 query=query_input,
                 collection_name="legal_docs",
                 top_k=5
-                # model_name parameter is optional - will use MODEL_ID from .env
             )
         st.info(answer)
 
 # --- Section 5: Compare Documents
-# (UNCHANGED — logic already good)
-# ...
+st.header("📑 Compare Two Documents")
+uploaded_file2 = st.file_uploader("Upload secondary document (.pdf or .docx)", type=["pdf", "docx"], key="u2")
+if uploaded_file2:
+    with st.spinner("Parsing second file..."):
+        text2 = parse_file(uploaded_file2)
+        st.session_state.doc2_text = text2
+    st.success("Second file parsed and stored in memory.")
+    st.text_area("Parsed text (secondary)", value=st.session_state.doc2_text[:4000], height=200)
 
-st.header("Download")
+if st.button("Compare Documents"):
+    if not st.session_state.doc1_text or not st.session_state.doc2_text:
+        st.error("Please upload both documents first.")
+    else:
+        diff_report = compare_documents(st.session_state.doc1_text, st.session_state.doc2_text)
+        st.markdown(diff_report)
+
+# --- Section 6: Download Placeholder
+st.header("⬇️ Download")
 st.write("Download functionality scaffolded (not wired to actual file outputs in this demo).")
-st.caption("Backend persist directory: " + VECTORSTORE_PERSIST_DIR)
