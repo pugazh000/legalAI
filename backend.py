@@ -265,10 +265,35 @@ def compare_documents(text1: str, text2: str) -> str:
     diff = difflib.unified_diff(a_lines, b_lines, fromfile="Document A", tofile="Document B", lineterm="")
     return "### Document Comparison\n```diff\n" + "\n".join(diff) + "\n```"
 
+def semantic_search_with_dates(query: str, collection_name: str = "legal_docs", top_k: int = 5) -> str:
+    """Semantic search + basic date validation (for validity check)."""
+    base_answer = semantic_search(query=query, collection_name=collection_name, top_k=top_k)
+    if collection_name not in VECTOR_STORES:
+        return base_answer
+
+    vectordb = VECTOR_STORES[collection_name]
+    docs = vectordb.similarity_search(query, k=top_k)
+    combined_text = " ".join(d.page_content for d in docs)
+    validation = simple_date_validator(combined_text)
+
+    status = validation.get("status", "UNKNOWN")
+    msg = validation.get("message", "No date information found")
+
+    if status == "EXPIRED":
+        return f"🔴 NO - {msg}"
+    elif status == "EXPIRING_SOON":
+        return f"🟡 ALMOST EXPIRED - {msg}"
+    elif status == "VALID":
+        return f"🟢 YES - {msg}"
+    else:
+        return base_answer
+
+
 # -------------------------------------------------------------------------
 # Entry Point
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
     print("✅ Backend module loaded successfully (FAISS + OpenRouter).")
     print("Model ID:", MODEL_ID)
+
 
