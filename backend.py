@@ -37,7 +37,7 @@ import docx
 # Config / Env
 # -------------------------------------------------------------------------
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL_ID = os.getenv("MODEL_ID", "x-ai/grok-4-fast:free")
+MODEL_ID = os.getenv("MODEL_ID", "nvidia/nemotron-nano-9b-v2:free")
 
 # Helpful debug print at import time (will show up in logs)
 print("=== BACKEND STARTUP ===")
@@ -319,3 +319,4 @@ def embed_texts(texts: List[str], embedding_model_name: str = "sentence-transfor
 if __name__ == "__main__":
     print("Backend module loaded (FAISS, OpenRouter).")
     print("Model ID:", MODEL_ID)
+
