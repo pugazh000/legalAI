@@ -1,11 +1,11 @@
+# backend.py
 """
 Backend logic for the Legal Document Simplifier AI.
 
-✅ Compatible with both new and old LangChain versions.
-✅ Uses OpenRouter via langchain_openai.ChatOpenAI.
-✅ Uses FAISS for in-memory vector storage (no SQLite dependency).
+- Uses OpenRouter via langchain_openai.ChatOpenAI
+- Uses FAISS for in-memory vector storage (no sqlite)
+- Includes date utilities and safe wrappers for robustness
 """
-
 import json
 import os
 import difflib
@@ -19,27 +19,64 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # -------------------------------------------------------------------------
-# LangChain / Embeddings / Vector DB / LLM
+# Defensive imports for LangChain universe (works across v0.2 / v0.3+)
 # -------------------------------------------------------------------------
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
-
-# Handle new/old LangChain LLMChain import paths
+# text splitter
 try:
-    from langchain.chains import LLMChain
-except ImportError:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except Exception:
     try:
-        from langchain.chains.llm import LLMChain
-    except ImportError:
-        try:
-            from langchain.chains.base import LLMChain
-        except ImportError:
-            from langchain_core.runnables import RunnableSequence as LLMChain
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+    except Exception:
+        raise ImportError(
+            "Cannot import RecursiveCharacterTextSplitter. "
+            "Install 'langchain-text-splitters' or a compatible langchain version."
+        )
 
-from langchain_openai import ChatOpenAI
+# embeddings + vectorstores (community package)
+try:
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_community.vectorstores import FAISS
+except Exception:
+    raise ImportError(
+        "Cannot import langchain_community components. Install 'langchain-community'."
+    )
+
+# Document & PromptTemplate (langchain_core for newer versions)
+try:
+    from langchain_core.documents import Document
+    from langchain_core.prompts import PromptTemplate
+except Exception:
+    # older installs may expose under langchain
+    try:
+        from langchain.docstore.document import Document
+        from langchain.prompts import PromptTemplate
+    except Exception:
+        raise ImportError(
+            "Cannot import Document/PromptTemplate. Install 'langchain-core' or compatible langchain."
+        )
+
+# LLMChain: try multiple locations, fallback to RunnableSequence if only that exists
+try:
+    # older / common path (keeps compatibility)
+    from langchain.chains.llm import LLMChain  # preferred if present
+except Exception:
+    try:
+        from langchain.chains.base import LLMChain
+    except Exception:
+        try:
+            # latest: runnable API - map to a compatible alias
+            from langchain_core.runnables import RunnableSequence as LLMChain  # type: ignore
+        except Exception:
+            raise ImportError(
+                "Cannot import LLMChain or RunnableSequence. Install a compatible langchain/langchain-core."
+            )
+
+# Chat client (OpenRouter via langchain-openai)
+try:
+    from langchain_openai import ChatOpenAI
+except Exception:
+    raise ImportError("Install 'langchain-openai' to use ChatOpenAI (OpenRouter support).")
 
 # File parsing
 import pdfplumber
@@ -48,52 +85,32 @@ import docx
 # -------------------------------------------------------------------------
 # Config / Env
 # -------------------------------------------------------------------------
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("GEMINI_API_KEY")
 MODEL_ID = os.getenv("MODEL_ID", "nvidia/nemotron-nano-9b-v2:free")
 
+# Helpful debug print at import time (will show up in logs)
 print("=== BACKEND STARTUP ===")
 print(f"Model ID from env: {MODEL_ID}")
 print(f"OPENROUTER_API_KEY present: {'YES' if OPENROUTER_API_KEY else 'NO'}")
 print("=======================")
 
 # -------------------------------------------------------------------------
-# Helper: Safe LLMChain runner (cross-version)
-# -------------------------------------------------------------------------
-def _safe_chain_run(llm, prompt, inputs: dict):
-    """Run chain safely across LangChain versions."""
-    try:
-        # Newer versions may use from_llm / invoke
-        if hasattr(LLMChain, "from_llm"):
-            chain = LLMChain.from_llm(llm, prompt)
-        else:
-            chain = LLMChain(llm=llm, prompt=prompt)
-
-        if hasattr(chain, "invoke"):
-            result = chain.invoke(inputs)
-            if isinstance(result, dict) and "text" in result:
-                return result["text"]
-            return str(result)
-        else:
-            return chain.run(inputs)
-    except TypeError as e:
-        print("⚠️ TypeError during chain run (retrying fallback):", e)
-        try:
-            chain = LLMChain(llm=llm, prompt=prompt)
-            return chain.run(inputs)
-        except Exception as ex:
-            return f"⚠️ LLMChain failed: {ex}"
-    except Exception as e:
-        return f"⚠️ Chain execution failed: {e}"
-
-# -------------------------------------------------------------------------
-# LLM client factory
+# LLM client factory (OpenRouter)
 # -------------------------------------------------------------------------
 def _get_llm(model_name: str = None, temperature: float = 0.0):
+    """Return a ChatOpenAI client configured for OpenRouter and log key/base status."""
     if model_name is None:
         model_name = MODEL_ID
 
-    print(f"🔧 Using LLM model: {model_name}")
-    print("🔧 Base: https://openrouter.ai/api/v1")
+    # Debug logs to help diagnose 401/auth issues on deploy
+    try:
+        key_present = bool(OPENROUTER_API_KEY and len(OPENROUTER_API_KEY) > 8)
+    except Exception:
+        key_present = False
+
+    print(f"🔧 _get_llm() -> model: {model_name}")
+    print(f"🔧 OPENROUTER key loaded? {'YES' if key_present else 'NO'}")
+    print("🔧 openai_api_base: https://openrouter.ai/api/v1 (requests will be routed there)")
 
     return ChatOpenAI(
         model=model_name,
@@ -106,24 +123,33 @@ def _get_llm(model_name: str = None, temperature: float = 0.0):
 # File parsing
 # -------------------------------------------------------------------------
 def parse_file(uploaded_file) -> str:
-    """Parse uploaded pdf/docx/txt and return extracted text."""
+    """Parse uploaded pdf/docx file-like object and return extracted text."""
     fname = uploaded_file.name.lower()
     content = uploaded_file.read()
+    text = ""
     if fname.endswith(".pdf"):
         with pdfplumber.open(io.BytesIO(content)) as pdf:
-            return "\n\n".join([page.extract_text() or "" for page in pdf.pages])
+            text = "\n\n".join([page.extract_text() or "" for page in pdf.pages])
     elif fname.endswith(".docx"):
         doc = docx.Document(io.BytesIO(content))
-        return "\n\n".join([p.text for p in doc.paragraphs])
+        text = "\n\n".join([p.text for p in doc.paragraphs])
     else:
-        return content.decode("utf-8", errors="ignore")
+        # fallback for plain text uploads
+        text = content.decode("utf-8", errors="ignore")
+    return text
 
 # -------------------------------------------------------------------------
-# Vector store (FAISS)
+# Embeddings & Vector store (FAISS, in-memory)
 # -------------------------------------------------------------------------
 def _get_embedding_model(embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    """Return a HuggingFaceEmbeddings instance.
+
+    NOTE: this downloads models from Hugging Face the first time you call it.
+    'sentence-transformers/all-MiniLM-L6-v2' is small and fast. No external API key required.
+    """
     return HuggingFaceEmbeddings(model_name=embedding_model_name)
 
+# Global in-memory stores (per-process)
 VECTOR_STORES: Dict[str, FAISS] = {}
 
 def chunk_and_store(
@@ -131,130 +157,218 @@ def chunk_and_store(
     collection_name: str = "legal_docs",
     chunk_size: int = 500,
     chunk_overlap: int = 50,
+    embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
 ):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    """
+    Split text into chunks, embed, and store in an in-memory FAISS vector store.
+    Returns the vector store object.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", " ", ""],
+    )
     chunks = splitter.split_text(text)
-    docs = [Document(page_content=c, metadata={"chunk_id": str(i)}) for i, c in enumerate(chunks)]
-    vectordb = FAISS.from_documents(docs, _get_embedding_model())
+    docs = [
+        Document(page_content=c, metadata={"chunk_id": str(i), "source": collection_name})
+        for i, c in enumerate(chunks)
+    ]
+
+    embedder = _get_embedding_model(embedding_model_name)
+    vectordb = FAISS.from_documents(docs, embedder)
     VECTOR_STORES[collection_name] = vectordb
-    print(f"📚 Stored {len(chunks)} chunks in FAISS collection '{collection_name}'")
+    print(f"📚 Stored {len(chunks)} chunks into FAISS collection '{collection_name}'")
     return vectordb
 
 # -------------------------------------------------------------------------
-# Core LLM functions
+# Core RAG functions
 # -------------------------------------------------------------------------
-def summarize_text(text: str, model_name: str = None) -> str:
-    llm = _get_llm(model_name)
-    prompt = PromptTemplate(
-        template="""Summarize this legal document in simple English.
-Include key purpose, obligations, and important dates.
-
-DOCUMENT:
-{doc}""",
-        input_variables=["doc"],
-    )
-    return _safe_chain_run(llm, prompt, {"doc": text})
-
-def semantic_search(query: str, collection_name="legal_docs", top_k=5, model_name=None) -> str:
+def semantic_search(
+    query: str,
+    collection_name: str = "legal_docs",
+    top_k: int = 5,
+    embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    model_name: str = None,
+) -> str:
+    """Retrieve relevant chunks and call LLM to answer in plain English."""
     if collection_name not in VECTOR_STORES:
-        return "⚠️ No document found. Upload and process one first."
+        return "⚠️ No vector store found. Please upload and process a document first."
+
     vectordb = VECTOR_STORES[collection_name]
     docs = vectordb.similarity_search(query, k=top_k)
-    context_text = "\n\n".join([d.page_content for d in docs])
-    llm = _get_llm(model_name)
-    prompt = PromptTemplate(
-        template="""You are a legal assistant. Use the retrieved context to answer clearly.
 
-CONTEXT:
+    # Build context from retrieved chunks
+    ctxs = [f"--- chunk {i} ---\n{d.page_content.strip()[:2000]}" for i, d in enumerate(docs)]
+    context_text = "\n\n".join(ctxs)
+
+    llm = _get_llm(model_name=model_name, temperature=0.0)
+    prompt_template = """You are a legal assistant. Use these retrieved chunks to answer:
+
+RETRIEVED CHUNKS:
 {context}
 
 QUESTION:
 {question}
 
-Answer in plain English for a non-lawyer.""",
-        input_variables=["context", "question"],
-    )
-    return _safe_chain_run(llm, prompt, {"context": context_text, "question": query})
+Answer clearly in plain English for a non-lawyer.
+"""
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    chain = LLMChain(llm=llm, prompt=prompt)
+    return chain.run({"context": context_text, "question": query})
+
+def summarize_text(text: str, model_name: str = None) -> str:
+    """Summarize a document in plain language (LLM call)."""
+    llm = _get_llm(model_name=model_name, temperature=0.0)
+    prompt_template = """Summarize the document in plain language.
+Highlight purpose, key obligations, important dates, and immediate actions.
+
+DOCUMENT:
+{doc}"""
+    prompt = PromptTemplate(template=prompt_template, input_variables=["doc"])
+    chain = LLMChain(llm=llm, prompt=prompt)
+    return chain.run({"doc": text})
 
 def analyze_document_for_risks(text: str, model_name: str = None) -> Tuple[Dict[str, List[str]], List[str]]:
-    llm = _get_llm(model_name)
-    prompt = PromptTemplate(
-        template="""Analyze this document for risks and obligations.
-Return valid JSON only.
+    """Ask LLM to identify risks and obligations and return parsed JSON (fallback-safe)."""
+    llm = _get_llm(model_name=model_name, temperature=0.0)
+    prompt_template = """Analyze this document and identify risks and obligations.
 
 DOCUMENT:
 {doc}
 
-JSON FORMAT:
+Respond in JSON:
 {
   "High": ["..."],
   "Medium": ["..."],
   "Low": ["..."],
   "Obligations": ["..."]
-}""",
-        input_variables=["doc"],
-    )
-    raw = _safe_chain_run(llm, prompt, {"doc": text[:8000]})
+}"""
+    prompt = PromptTemplate(template=prompt_template, input_variables=["doc"])
+    chain = LLMChain(llm=llm, prompt=prompt)
+    raw = chain.run({"doc": text[:8000]})
     try:
-        data = json.loads(re.search(r"\{.*\}", raw, re.DOTALL).group(0))
-    except Exception:
-        data = {"High": [], "Medium": [], "Low": [], "Obligations": []}
-    return {k: data.get(k, []) for k in ["High", "Medium", "Low"]}, data.get("Obligations", [])
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = "\n".join(cleaned.splitlines()[1:-1])
+        parsed = json.loads(re.search(r"\{.*\}", cleaned, re.DOTALL).group(0))
+    except Exception as e:
+        print("⚠️ Risk parsing failed:", e)
+        parsed = {"High": [], "Medium": [], "Low": [], "Obligations": []}
+    return {k: parsed.get(k, []) for k in ["High", "Medium", "Low"]}, parsed.get("Obligations", [])
 
-def safe_analyze_document_for_risks(text: str, model_name: str = None):
+def safe_analyze_document_for_risks(text: str, model_name: str = None) -> Tuple[Dict[str, List[str]], List[str]]:
+    """Wrapper with fallback when LLM analysis fails."""
     try:
         return analyze_document_for_risks(text, model_name)
     except Exception as e:
-        print("⚠️ Safe fallback triggered:", e)
-        return {"High": [], "Medium": [], "Low": []}, ["Manual review recommended."]
+        print("⚠️ safe_analyze_document_for_risks fallback triggered:", e)
+        risks = {"High": [], "Medium": [], "Low": []}
+        obligations = ["Manual review recommended due to analysis limitations"]
+        return risks, obligations
 
 # -------------------------------------------------------------------------
-# Date Extraction & Validation
+# Date Validators & Smart Semantic Search
 # -------------------------------------------------------------------------
 def simple_date_validator(text: str) -> Dict[str, Any]:
-    dates = re.findall(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", text)
-    result = {"status": "UNKNOWN", "message": "No clear dates found"}
-    if not dates:
-        return result
-    try:
-        expiry = parse_date(dates[-1])
-        now = datetime.now()
-        if expiry < now:
-            return {"status": "EXPIRED", "message": f"Expired on {expiry.date()}"}
-        elif expiry < now + timedelta(days=30):
-            return {"status": "EXPIRING_SOON", "message": f"Expires soon on {expiry.date()}"}
-        else:
-            return {"status": "VALID", "message": f"Valid until {expiry.date()}"}
-    except Exception as e:
-        return {"status": "ERROR", "message": str(e)}
+    """Simple date extraction/validity check using ISO-like date patterns."""
+    date_matches = re.findall(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", text)
+    results = {"status": "UNKNOWN", "message": "No clear dates found", "action_needed": []}
+
+    if date_matches:
+        try:
+            expiry = parse_date(date_matches[-1])
+            now = datetime.now()
+            if expiry < now:
+                results["status"] = "EXPIRED"
+                results["message"] = f"Expired on {expiry.date()}"
+                results["action_needed"].append("Renew or renegotiate the contract")
+            elif expiry < now + timedelta(days=30):
+                results["status"] = "EXPIRING_SOON"
+                results["message"] = f"Expires soon on {expiry.date()}"
+                results["action_needed"].append("Plan renewal or extension")
+            else:
+                results["status"] = "VALID"
+                results["message"] = f"Valid until {expiry.date()}"
+        except Exception as e:
+            results["message"] = f"Date parsing failed: {e}"
+    return results
+
+def semantic_search_with_dates(query: str, collection_name: str = "legal_docs", top_k: int = 5) -> str:
+    """Run semantic search and appended date-validation result for time-sensitive queries."""
+    base_answer = semantic_search(query=query, collection_name=collection_name, top_k=top_k)
+    if collection_name not in VECTOR_STORES:
+        return base_answer
+
+    vectordb = VECTOR_STORES[collection_name]
+    docs = vectordb.similarity_search(query, k=top_k)
+    combined_text = " ".join(d.page_content for d in docs)
+    validation = simple_date_validator(combined_text)
+
+    if validation["status"] == "EXPIRED":
+        return f"🔴 NO - {validation['message']}"
+    elif validation["status"] == "EXPIRING_SOON":
+        return f"🟡 ALMOST EXPIRED - {validation['message']}"
+    elif validation["status"] == "VALID":
+        return f"🟢 YES - {validation['message']}"
+    else:
+        return base_answer
 
 def intelligent_date_extraction_and_validation(text: str) -> Dict[str, Any]:
-    matches = re.findall(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", text)
+    """Find multiple ISO-like dates in text and classify them by status."""
+    date_matches = re.findall(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", text)
+    extracted_dates = []
     now = datetime.now()
-    out = []
-    for d in matches:
+    for d in date_matches:
         try:
             dt = parse_date(d)
             if dt < now:
-                s = "Past"
+                status = "Past"
             elif dt < now + timedelta(days=30):
-                s = "Expiring Soon"
+                status = "Expiring Soon"
             else:
-                s = "Future"
-            out.append({"date": str(dt.date()), "status": s})
+                status = "Future"
+            extracted_dates.append({"date": str(dt.date()), "status": status})
         except Exception:
             continue
-    return {"count": len(out), "dates": out}
+    return {"dates": extracted_dates, "count": len(extracted_dates)}
+
+def semantic_search_with_intelligent_validation(query: str, collection_name: str = "legal_docs", top_k: int = 5) -> str:
+    """Semantic search plus a helpful date-extraction summary appended to the LLM answer."""
+    base_answer = semantic_search(query=query, collection_name=collection_name, top_k=top_k)
+    if collection_name not in VECTOR_STORES:
+        return base_answer
+
+    vectordb = VECTOR_STORES[collection_name]
+    docs = vectordb.similarity_search(query, k=top_k)
+    combined_text = " ".join(d.page_content for d in docs)
+    extracted = intelligent_date_extraction_and_validation(combined_text)
+
+    if not extracted["dates"]:
+        return base_answer + "\n\nℹ️ No clear dates found in document."
+    else:
+        summary_lines = [f"- {d['date']} → {d['status']}" for d in extracted["dates"]]
+        return base_answer + "\n\n📅 Date Analysis:\n" + "\n".join(summary_lines)
 
 # -------------------------------------------------------------------------
-# Document Comparison
+# Utilities
 # -------------------------------------------------------------------------
 def compare_documents(text1: str, text2: str) -> str:
-    a, b = text1.splitlines(), text2.splitlines()
-    diff = difflib.unified_diff(a, b, fromfile="Document A", tofile="Document B", lineterm="")
-    return "### Document Comparison\n```diff\n" + "\n".join(diff) + "\n```"
+    """Simple unified-diff style comparison returned as markdown codeblock."""
+    a_lines, b_lines = text1.splitlines(), text2.splitlines()
+    diff = difflib.unified_diff(a_lines, b_lines, fromfile="Document A", tofile="Document B", lineterm="")
+    md_lines = ["### Document Comparison\n", "```diff"]
+    md_lines.extend(list(diff))
+    md_lines.append("```")
+    return "\n".join(md_lines)
+
+def embed_texts(texts: List[str], embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> List[List[float]]:
+    """Return raw embeddings for a list of texts (uses HuggingFaceEmbeddings)."""
+    embedder = _get_embedding_model(embedding_model_name)
+    return embedder.embed_documents(texts)
 
 # -------------------------------------------------------------------------
+# Entry point
+# -------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("✅ Backend ready (OpenRouter + FAISS)")
-    print("Model:", MODEL_ID)
+    print("Backend module loaded (FAISS, OpenRouter).")
+    print("Model ID:", MODEL_ID)
