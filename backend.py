@@ -1,8 +1,70 @@
+"""
+Backend logic for ⚖️ The Legal Simplifier AI
+
+- Uses OpenRouter via langchain_openai.ChatOpenAI
+- Uses FAISS for in-memory vector storage
+- Compatible with LangChain v0.2 and v0.3+
+"""
+
+import os
+import io
+import re
+import json
+import difflib
+from datetime import datetime, timedelta
+from dateutil.parser import parse as parse_date
+from typing import Dict, List, Tuple, Any
+
+import pdfplumber
+import docx
+from dotenv import load_dotenv
+
+# Load environment
+load_dotenv()
+
+# -------------------------------------------------------------------------
+# LangChain imports (safe across versions)
+# -------------------------------------------------------------------------
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+try:
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_community.vectorstores import FAISS
+except ImportError:
+    from langchain.embeddings.huggingface import HuggingFaceEmbeddings
+    from langchain.vectorstores import FAISS
+
+try:
+    from langchain_core.documents import Document
+    from langchain_core.prompts import PromptTemplate
+except ImportError:
+    from langchain.docstore.document import Document
+    from langchain.prompts import PromptTemplate
+
+try:
+    from langchain_openai import ChatOpenAI
+except ImportError:
+    raise ImportError("Please install 'langchain-openai' to use OpenRouter LLMs.")
+
+# -------------------------------------------------------------------------
+# Config
+# -------------------------------------------------------------------------
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("GEMINI_API_KEY")
+MODEL_ID = os.getenv("MODEL_ID", "nvidia/nemotron-nano-9b-v2:free")
+
+print("=== BACKEND STARTUP ===")
+print(f"Model ID: {MODEL_ID}")
+print(f"OpenRouter API key present: {'YES' if OPENROUTER_API_KEY else 'NO'}")
+print("========================")
+
 # -------------------------------------------------------------------------
 # LLM client factory (OpenRouter)
 # -------------------------------------------------------------------------
 def _get_llm(model_name: str = None, temperature: float = 0.0):
-    """Return a ChatOpenAI client configured for OpenRouter and log key/base status."""
+    """Return a ChatOpenAI client configured for OpenRouter."""
     if model_name is None:
         model_name = MODEL_ID
 
@@ -12,8 +74,7 @@ def _get_llm(model_name: str = None, temperature: float = 0.0):
         key_present = False
 
     print(f"🔧 _get_llm() -> model: {model_name}")
-    print(f"🔧 OPENROUTER key loaded? {'YES' if key_present else 'NO'}")
-    print("🔧 openai_api_base: https://openrouter.ai/api/v1 (requests will be routed there)")
+    print(f"🔧 OpenRouter key loaded? {'YES' if key_present else 'NO'}")
 
     return ChatOpenAI(
         model=model_name,
@@ -28,12 +89,10 @@ def _get_llm(model_name: str = None, temperature: float = 0.0):
 def run_llm_chain(llm, prompt: "PromptTemplate", inputs: dict) -> str:
     """Run LLM chain compatible with both LangChain v0.2 and v0.3+."""
     try:
-        # Old API
         from langchain.chains import LLMChain
         chain = LLMChain(llm=llm, prompt=prompt)
         return chain.run(inputs)
     except Exception:
-        # New Runnable API
         runnable = prompt | llm
         result = runnable.invoke(inputs)
         if isinstance(result, dict) and "text" in result:
@@ -47,6 +106,7 @@ def parse_file(uploaded_file) -> str:
     """Parse uploaded pdf/docx file-like object and return extracted text."""
     fname = uploaded_file.name.lower()
     content = uploaded_file.read()
+
     if fname.endswith(".pdf"):
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             return "\n\n".join([page.extract_text() or "" for page in pdf.pages])
@@ -60,11 +120,18 @@ def parse_file(uploaded_file) -> str:
 # Embeddings & Vector store (FAISS, in-memory)
 # -------------------------------------------------------------------------
 def _get_embedding_model(embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    """Return HuggingFace embedding model (no API key required)."""
     return HuggingFaceEmbeddings(model_name=embedding_model_name)
 
 VECTOR_STORES: Dict[str, FAISS] = {}
 
-def chunk_and_store(text: str, collection_name: str = "legal_docs", chunk_size: int = 500, chunk_overlap: int = 50):
+def chunk_and_store(
+    text: str,
+    collection_name: str = "legal_docs",
+    chunk_size: int = 500,
+    chunk_overlap: int = 50,
+):
+    """Split text into chunks, embed, and store in FAISS memory."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -196,6 +263,9 @@ def compare_documents(text1: str, text2: str) -> str:
     md_lines.append("```")
     return "\n".join(md_lines)
 
+# -------------------------------------------------------------------------
+# Entry point
+# -------------------------------------------------------------------------
 if __name__ == "__main__":
     print("✅ Backend module loaded successfully (FAISS + OpenRouter ready).")
     print("Model ID:", MODEL_ID)
