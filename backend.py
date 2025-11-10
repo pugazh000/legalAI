@@ -26,7 +26,17 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
-from langchain.chains.base import LLMChain
+
+from langchain.chains import LLMChain
+try:
+    from langchain.chains.llm import LLMChain  # new versions
+except ImportError:
+    try:
+        from langchain.chains.base import LLMChain  # fallback
+    except ImportError:
+        from langchain_core.runnables import RunnableSequence as LLMChain  # latest
+
+
 from langchain_openai import ChatOpenAI
 
 
@@ -320,6 +330,7 @@ def embed_texts(texts: List[str], embedding_model_name: str = "sentence-transfor
 if __name__ == "__main__":
     print("Backend module loaded (FAISS, OpenRouter).")
     print("Model ID:", MODEL_ID)
+
 
 
 
