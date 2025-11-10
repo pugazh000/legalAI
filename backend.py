@@ -264,8 +264,53 @@ def compare_documents(text1: str, text2: str) -> str:
     return "\n".join(md_lines)
 
 # -------------------------------------------------------------------------
+# Advanced Date Extraction + Intelligent Search
+# -------------------------------------------------------------------------
+def intelligent_date_extraction_and_validation(text: str) -> Dict[str, Any]:
+    """Find all dates in text and label them as Past / Expiring Soon / Future."""
+    date_matches = re.findall(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", text)
+    extracted_dates = []
+    now = datetime.now()
+    for d in date_matches:
+        try:
+            dt = parse_date(d)
+            if dt < now:
+                status = "Past"
+            elif dt < now + timedelta(days=30):
+                status = "Expiring Soon"
+            else:
+                status = "Future"
+            extracted_dates.append({"date": str(dt.date()), "status": status})
+        except Exception:
+            continue
+    return {"dates": extracted_dates, "count": len(extracted_dates)}
+
+def semantic_search_with_intelligent_validation(
+    query: str,
+    collection_name: str = "legal_docs",
+    top_k: int = 5
+) -> str:
+    """Run semantic search and append date analysis results."""
+    base_answer = semantic_search(query=query, collection_name=collection_name, top_k=top_k)
+    if collection_name not in VECTOR_STORES:
+        return base_answer
+
+    vectordb = VECTOR_STORES[collection_name]
+    docs = vectordb.similarity_search(query, k=top_k)
+    combined_text = " ".join(d.page_content for d in docs)
+    extracted = intelligent_date_extraction_and_validation(combined_text)
+
+    if not extracted["dates"]:
+        return base_answer + "\n\nℹ️ No clear dates found."
+    else:
+        summary_lines = [f"- {d['date']} → {d['status']}" for d in extracted["dates"]]
+        return base_answer + "\n\n📅 Date Analysis:\n" + "\n".join(summary_lines)
+
+
+# -------------------------------------------------------------------------
 # Entry point
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
     print("✅ Backend module loaded successfully (FAISS + OpenRouter ready).")
     print("Model ID:", MODEL_ID)
+
