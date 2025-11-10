@@ -1,3 +1,4 @@
+# backend.py
 """
 Backend logic for the Legal Document Simplifier AI.
 
@@ -5,7 +6,6 @@ Backend logic for the Legal Document Simplifier AI.
 - Uses FAISS for in-memory vector storage (no sqlite)
 - Includes date utilities and safe wrappers for robustness
 """
-
 import json
 import os
 import difflib
@@ -19,26 +19,64 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # -------------------------------------------------------------------------
-# LangChain / Embeddings / Vector DB / LLM
+# Defensive imports for LangChain universe (works across v0.2 / v0.3+)
 # -------------------------------------------------------------------------
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
-
-from langchain.chains import LLMChain
+# text splitter
 try:
-    from langchain.chains.llm import LLMChain  # new versions
-except ImportError:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except Exception:
     try:
-        from langchain.chains.base import LLMChain  # fallback
-    except ImportError:
-        from langchain_core.runnables import RunnableSequence as LLMChain  # latest
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+    except Exception:
+        raise ImportError(
+            "Cannot import RecursiveCharacterTextSplitter. "
+            "Install 'langchain-text-splitters' or a compatible langchain version."
+        )
 
+# embeddings + vectorstores (community package)
+try:
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_community.vectorstores import FAISS
+except Exception:
+    raise ImportError(
+        "Cannot import langchain_community components. Install 'langchain-community'."
+    )
 
-from langchain_openai import ChatOpenAI
+# Document & PromptTemplate (langchain_core for newer versions)
+try:
+    from langchain_core.documents import Document
+    from langchain_core.prompts import PromptTemplate
+except Exception:
+    # older installs may expose under langchain
+    try:
+        from langchain.docstore.document import Document
+        from langchain.prompts import PromptTemplate
+    except Exception:
+        raise ImportError(
+            "Cannot import Document/PromptTemplate. Install 'langchain-core' or compatible langchain."
+        )
 
+# LLMChain: try multiple locations, fallback to RunnableSequence if only that exists
+try:
+    # older / common path (keeps compatibility)
+    from langchain.chains.llm import LLMChain  # preferred if present
+except Exception:
+    try:
+        from langchain.chains.base import LLMChain
+    except Exception:
+        try:
+            # latest: runnable API - map to a compatible alias
+            from langchain_core.runnables import RunnableSequence as LLMChain  # type: ignore
+        except Exception:
+            raise ImportError(
+                "Cannot import LLMChain or RunnableSequence. Install a compatible langchain/langchain-core."
+            )
+
+# Chat client (OpenRouter via langchain-openai)
+try:
+    from langchain_openai import ChatOpenAI
+except Exception:
+    raise ImportError("Install 'langchain-openai' to use ChatOpenAI (OpenRouter support).")
 
 # File parsing
 import pdfplumber
@@ -47,7 +85,7 @@ import docx
 # -------------------------------------------------------------------------
 # Config / Env
 # -------------------------------------------------------------------------
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("GEMINI_API_KEY")
 MODEL_ID = os.getenv("MODEL_ID", "nvidia/nemotron-nano-9b-v2:free")
 
 # Helpful debug print at import time (will show up in logs)
@@ -104,7 +142,11 @@ def parse_file(uploaded_file) -> str:
 # Embeddings & Vector store (FAISS, in-memory)
 # -------------------------------------------------------------------------
 def _get_embedding_model(embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-    """Return a HuggingFaceEmbeddings instance."""
+    """Return a HuggingFaceEmbeddings instance.
+
+    NOTE: this downloads models from Hugging Face the first time you call it.
+    'sentence-transformers/all-MiniLM-L6-v2' is small and fast. No external API key required.
+    """
     return HuggingFaceEmbeddings(model_name=embedding_model_name)
 
 # Global in-memory stores (per-process)
@@ -330,8 +372,3 @@ def embed_texts(texts: List[str], embedding_model_name: str = "sentence-transfor
 if __name__ == "__main__":
     print("Backend module loaded (FAISS, OpenRouter).")
     print("Model ID:", MODEL_ID)
-
-
-
-
-
